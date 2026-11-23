@@ -1,0 +1,6 @@
+[Unit]
+Description=Snapshot Claude Code sessions running in Herdr
+
+[Service]
+Type=oneshot
+ExecStart=__BIN__ snapshot --quiet

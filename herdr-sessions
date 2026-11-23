@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Save and restore the Claude Code sessions running in Herdr workspaces.
+
+  herdr-sessions snapshot            write ~/.config/herdr/claude-sessions.json from the live layout
+  herdr-sessions show                print the saved manifest as a table
+  herdr-sessions restore [--dry-run] recreate missing workspaces/tabs/panes and resume every Claude session
+  herdr-sessions update              install the latest release if it is newer
+
+Run `snapshot` before a reboot or a Herdr update, `restore` after Herdr is open again.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+VERSION = "0.1.0"
+REPO = "eng1n88r/herdr-sessions"
+HERDR = os.path.expanduser("~/.local/bin/herdr")
+MANIFEST = os.path.expanduser("~/.config/herdr/claude-sessions.json")
+REGISTRY = os.path.expanduser("~/.claude/sessions")
+DROP_ARGS = {"--resume", "-r", "--continue", "-c", "--session-id", "--fork-session", "--reply-on-resume"}
+DROP_WITH_VALUE = {"--resume", "-r", "--session-id"}
+
+
+def herdr(*args, check=True):
+    out = subprocess.run([HERDR, *args], capture_output=True, text=True)
+    if check and out.returncode != 0:
+        sys.exit("herdr %s failed: %s%s" % (" ".join(args), out.stdout, out.stderr))
+    try:
+        return json.loads(out.stdout)["result"]
+    except (ValueError, KeyError):
+        return out.stdout
+
+
+def pane_number(pane_id):
+    # Herdr ids go 1-9 then A, B, ... (base 36)
+    return int(pane_id.rsplit("p", 1)[1], 36)
+
+
+def live_layout():
+    workspaces = sorted(herdr("workspace", "list")["workspaces"], key=lambda w: w["number"])
+    tabs = herdr("tab", "list")["tabs"]
+    panes = herdr("pane", "list")["panes"]
+    for w in workspaces:
+        w["tabs"] = sorted([t for t in tabs if t["workspace_id"] == w["workspace_id"]], key=lambda t: t["number"])
+        for t in w["tabs"]:
+            t["panes"] = sorted([p for p in panes if p["tab_id"] == t["tab_id"]], key=lambda p: pane_number(p["pane_id"]))
+    return workspaces
+
+
+def registry():
+    """pid -> Claude session record, from ~/.claude/sessions/<pid>.json."""
+    found = {}
+    for name in os.listdir(REGISTRY):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(REGISTRY, name)) as f:
+                rec = json.load(f)
+            os.kill(rec["pid"], 0)
+            found[rec["pid"]] = rec
+        except (ValueError, KeyError, OSError):
+            continue
+    return found
+
+
+def claude_args(argv):
+    out, skip = [], False
+    for a in argv[1:]:
+        if skip:
+            skip = False
+            continue
+        if a in DROP_WITH_VALUE:
+            skip = True
+            continue
+        if a in DROP_ARGS:
+            continue
+        out.append(a)
+    return out
+
+
+def pane_session(pane, sessions):
+    info = herdr("pane", "process-info", "--pane", pane["pane_id"])["process_info"]
+    for proc in info.get("foreground_processes", []):
+        rec = sessions.get(proc.get("pid"))
+        if rec and rec.get("kind") == "interactive":
+            return rec, claude_args(proc.get("argv") or [])
+    if pane.get("agent") == "claude":
+        title = pane.get("terminal_title_stripped")
+        for rec in sessions.values():
+            if rec.get("kind") == "interactive" and rec.get("cwd") == pane["cwd"] and rec.get("name") == title:
+                return rec, ["--dangerously-skip-permissions"]
+    return None, []
+
+
+def snapshot(args):
+    sessions = registry()
+    manifest = {"saved_at": time.strftime("%Y-%m-%d %H:%M:%S"), "workspaces": []}
+    for w in live_layout():
+        entry = {"label": w["label"], "focused": w["focused"], "tabs": []}
+        for t in w["tabs"]:
+            tab = {"panes": []}
+            for p in t["panes"]:
+                rec, cargs = pane_session(p, sessions)
+                pane = {"cwd": p["cwd"]}
+                if rec:
+                    pane.update({"session_id": rec["sessionId"], "session_name": rec.get("name"), "args": cargs})
+                tab["panes"].append(pane)
+            entry["tabs"].append(tab)
+        manifest["workspaces"].append(entry)
+    os.makedirs(os.path.dirname(MANIFEST), exist_ok=True)
+    with open(MANIFEST, "w") as f:
+        json.dump(manifest, f, indent=2)
+    if not args.quiet:
+        show(args)
+        print("\nsaved %s" % MANIFEST)
+
+
+def load_manifest():
+    try:
+        with open(MANIFEST) as f:
+            return json.load(f)
+    except OSError:
+        sys.exit("no manifest at %s; run `herdr-sessions snapshot` first" % MANIFEST)
+
+
+def show(args):
+    m = load_manifest()
+    print("manifest %s (saved %s)" % (MANIFEST, m["saved_at"]))
+    for w in m["workspaces"]:
+        print("%s%s" % (w["label"], "  *" if w.get("focused") else ""))
+        for ti, t in enumerate(w["tabs"], 1):
+            for pi, p in enumerate(t["panes"], 1):
+                what = ("claude --resume %s  (%s)" % (p["session_id"][:8], p.get("session_name"))) if p.get("session_id") else "shell"
+                print("  tab %d pane %d  %s" % (ti, pi, what))
+
+
+def server_running():
+    out = subprocess.run([HERDR, "status", "server"], capture_output=True, text=True).stdout
+    return "status: running" in out
+
+
+def find_id(result, key):
+    if isinstance(result, dict):
+        if key in result:
+            return result[key]
+        for v in result.values():
+            got = find_id(v, key)
+            if got:
+                return got
+    return None
+
+
+def restore(args):
+    m = load_manifest()
+    if not server_running():
+        sys.exit("Herdr is not running: open it first (`herdr`), then rerun restore")
+    dry = args.dry_run
+    started = []
+    for mw in m["workspaces"]:
+        live = {w["label"]: w for w in live_layout()}
+        w = live.get(mw["label"])
+        root_cwd = mw["tabs"][0]["panes"][0]["cwd"]
+        if w is None:
+            print("create workspace %s" % mw["label"])
+            if not dry:
+                res = herdr("workspace", "create", "--cwd", root_cwd, "--label", mw["label"], "--no-focus")
+                wid = find_id(res, "workspace_id")
+                w = next((x for x in live_layout() if x["workspace_id"] == wid or x["label"] == mw["label"]), None)
+                if w is None:
+                    sys.exit("workspace %s did not appear" % mw["label"])
+            else:
+                w = {"workspace_id": "?", "tabs": []}
+        for ti, mt in enumerate(mw["tabs"]):
+            tab_cwd = mt["panes"][0]["cwd"]
+            if ti < len(w["tabs"]):
+                t = w["tabs"][ti]
+            else:
+                print("  create tab %d in %s" % (ti + 1, mw["label"]))
+                if dry:
+                    t = {"tab_id": "?", "panes": []}
+                else:
+                    herdr("tab", "create", "--workspace", w["workspace_id"], "--cwd", tab_cwd)
+                    w = next(x for x in live_layout() if x["workspace_id"] == w["workspace_id"])
+                    t = w["tabs"][ti]
+            for pi, mp in enumerate(mt["panes"]):
+                if pi < len(t["panes"]):
+                    p = t["panes"][pi]
+                else:
+                    print("  split pane %d in %s tab %d" % (pi + 1, mw["label"], ti + 1))
+                    if dry:
+                        p = {"pane_id": "?", "agent": None}
+                    else:
+                        herdr("pane", "split", "--pane", t["panes"][0]["pane_id"], "--direction", "right", "--cwd", mp["cwd"])
+                        w = next(x for x in live_layout() if x["workspace_id"] == w["workspace_id"])
+                        t = w["tabs"][ti]
+                        p = t["panes"][pi]
+                if not mp.get("session_id"):
+                    continue
+                if p.get("agent") == "claude":
+                    print("  %s already runs claude, skip (%s)" % (p["pane_id"], mp.get("session_name")))
+                    continue
+                cmd = "cd %s && claude %s --resume %s" % (
+                    shell_quote(mp["cwd"]), " ".join(mp.get("args") or []), mp["session_id"])
+                print("  %s: %s" % (p["pane_id"], cmd))
+                if not dry:
+                    herdr("pane", "run", p["pane_id"], cmd)
+                    started.append((p["pane_id"], mp.get("session_name")))
+    for pane_id, name in started:
+        res = subprocess.run([HERDR, "agent", "wait", pane_id, "--until", "idle", "--until", "working",
+                              "--until", "blocked", "--timeout", "90000"], capture_output=True, text=True)
+        print("%s %s: %s" % (pane_id, name, "ready" if res.returncode == 0 else "not detected yet"))
+    focus = next((w for w in m["workspaces"] if w.get("focused")), None)
+    if focus and not dry:
+        live = {w["label"]: w for w in live_layout()}
+        if focus["label"] in live:
+            herdr("workspace", "focus", live[focus["label"]]["workspace_id"], check=False)
+    print("restored %d session(s)" % len(started))
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in v.split("."))
+
+
+def update(args):
+    here = os.path.dirname(os.path.realpath(__file__))
+    if os.path.isdir(os.path.join(here, ".git")):
+        sys.exit("running from a git checkout (%s); use `git pull` there instead" % here)
+    # Latest version from the /releases/latest redirect (no API token needed).
+    out = subprocess.run(["curl", "-fsSLI", "-o", os.devnull, "-w", "%{url_effective}",
+                          "https://github.com/%s/releases/latest" % REPO], capture_output=True, text=True)
+    m = re.search(r"/tag/v(\d+(?:\.\d+)*)$", out.stdout.strip())
+    if out.returncode != 0 or not m:
+        sys.exit("cannot determine the latest version: %s" % (out.stderr.strip() or out.stdout.strip()))
+    latest = m.group(1)
+    if version_tuple(latest) <= version_tuple(VERSION):
+        print("herdr-sessions %s is up to date" % VERSION)
+        return
+    print("updating herdr-sessions %s -> %s" % (VERSION, latest))
+    script = subprocess.run(["curl", "-fsSL", "https://raw.githubusercontent.com/%s/v%s/install.sh" % (REPO, latest)],
+                            capture_output=True)
+    if script.returncode != 0:
+        sys.exit("cannot download the installer: %s" % script.stderr.decode().strip())
+    sys.exit(subprocess.run(["bash"], input=script.stdout).returncode)
+
+
+def shell_quote(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", "-V", action="version", version="herdr-sessions %s" % VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("snapshot"); s.add_argument("--quiet", action="store_true"); s.set_defaults(fn=snapshot)
+    sub.add_parser("show").set_defaults(fn=show)
+    r = sub.add_parser("restore"); r.add_argument("--dry-run", action="store_true"); r.set_defaults(fn=restore)
+    sub.add_parser("update").set_defaults(fn=update)
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

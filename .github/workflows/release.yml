@@ -1,0 +1,30 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make check
+      - name: Check the tag matches VERSION
+        run: |
+          version=$(python3 herdr-sessions --version | awk '{print $2}')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION $version in herdr-sessions"
+            exit 1
+          fi
+      - name: Package
+        run: |
+          make dist
+          sha256sum herdr-sessions.tar.gz > herdr-sessions.tar.gz.sha256
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" herdr-sessions.tar.gz herdr-sessions.tar.gz.sha256 --generate-notes
